@@ -2,11 +2,11 @@
 
 ## 1. Server EXE (`kq-tunnel-server`)
 
-- [ ] Parse target host:port from command-line args (default `localhost:22`)
-- [ ] Open DVC with `WTSVirtualChannelOpenEx`
-- [ ] Connect to target TCP endpoint with Asio
-- [ ] Bridge data: DVC read → TCP write, TCP read → DVC write
-- [ ] Clean shutdown on DVC close or TCP disconnect
+- [x] Parse target host:port from command-line args (default `localhost:22`)
+- [x] Open DVC with `WTSVirtualChannelOpenEx`
+- [x] Connect to target TCP endpoint with Asio
+- [x] Bridge data: DVC read → TCP write, TCP read → DVC write
+- [x] Clean shutdown on DVC close or TCP disconnect
 
 ## 2. Plugin DLL (`kq-tunnel-plugin`)
 
@@ -33,3 +33,6 @@ The plugin is a pipe **client**, not server. The client EXE owns the pipe.
 - Single TCP connection at a time (SSH handles multiplexing)
 - Plugin instances in other RDP sessions silently do nothing (no pipe to
   connect to, or no DVC channel open)
+- Plugin connects to pipe lazily on first OnDataReceived, not eagerly on
+  channel open. This removes startup order constraints and handles client
+  EXE restarts.
