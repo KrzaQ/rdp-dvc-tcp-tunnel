@@ -21,11 +21,11 @@ The plugin is a pipe **client**, not server. The client EXE owns the pipe.
 
 ## 3. Client EXE (`kq-tunnel-client`)
 
-- [ ] Create named pipe `\\.\pipe\kq-tunnel` (`CreateNamedPipe`)
-- [ ] Listen on `localhost:2222` with Asio
-- [ ] On TCP connection: bridge TCP ↔ pipe
-- [ ] On TCP disconnect: clean up, keep listening for new connections
-- [ ] Clean shutdown on pipe disconnect (plugin/RDP gone)
+- [x] Create named pipe `\\.\pipe\kq-tunnel` (`CreateNamedPipe`)
+- [x] Listen on `localhost:2222` with Asio
+- [x] On TCP connection: bridge TCP ↔ pipe
+- [x] On TCP disconnect: clean up, keep listening for new connections
+- [x] Clean shutdown on pipe disconnect (plugin/RDP gone)
 
 ## Notes
 
