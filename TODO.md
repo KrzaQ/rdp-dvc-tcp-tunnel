@@ -12,12 +12,12 @@
 
 The plugin is a pipe **client**, not server. The client EXE owns the pipe.
 
-- [ ] On DVC channel open: connect to `\\.\pipe\kq-tunnel` via `CreateFile`
-- [ ] On `OnDataReceived`: write DVC data to pipe
-- [ ] Read from pipe, send via `IWTSVirtualChannel::Write`
-- [ ] On DVC close: disconnect from pipe
-- [ ] Handle pipe not existing gracefully (no server EXE running = no-op)
-- [ ] Threading: pipe reads need overlapped I/O or a worker thread
+- [x] On DVC channel open: connect to `\\.\pipe\kq-tunnel` via `CreateFile`
+- [x] On `OnDataReceived`: write DVC data to pipe
+- [x] Read from pipe, send via `IWTSVirtualChannel::Write`
+- [x] On DVC close: disconnect from pipe
+- [x] Handle pipe not existing gracefully (no server EXE running = no-op)
+- [x] Threading: pipe reads need overlapped I/O or a worker thread
 
 ## 3. Client EXE (`kq-tunnel-client`)
 

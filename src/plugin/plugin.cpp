@@ -2,6 +2,9 @@
 #include <initguid.h>
 #include <tsvirtualchannels.h>
 
+#include <thread>
+#include <vector>
+
 #include "protocol.hpp"
 
 // {8B6D78AA-856B-4D4F-A2A2-0C0CCC4B4E18}
@@ -26,6 +29,9 @@ public:
 
     ~KqTunnelChannelCallback()
     {
+        closePipe();
+        if (readerThread_.joinable())
+            readerThread_.join();
         if (channel_)
             channel_->Release();
     }
@@ -54,21 +60,88 @@ public:
     // IWTSVirtualChannelCallback
     HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG size, BYTE* data) override
     {
-        // TODO: forward data from DVC to named pipe
+        if (!ensurePipe())
+            return S_OK;
+
+        DWORD written = 0;
+        if (!WriteFile(pipe_, data, size, &written, nullptr)) {
+            closePipe();
+        }
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE OnClose() override
     {
-        // TODO: signal pipe disconnection
-        channel_->Release();
-        channel_ = nullptr;
+        closePipe();
+        if (readerThread_.joinable())
+            readerThread_.join();
+        if (channel_) {
+            channel_->Release();
+            channel_ = nullptr;
+        }
         return S_OK;
     }
 
 private:
+    bool ensurePipe()
+    {
+        if (pipe_ != INVALID_HANDLE_VALUE)
+            return true;
+
+        HANDLE h = CreateFileA(
+            kq::pipeName,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            0,
+            nullptr);
+
+        if (h == INVALID_HANDLE_VALUE)
+            return false;
+
+        DWORD mode = PIPE_READMODE_BYTE;
+        SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
+        pipe_ = h;
+
+        // Join any previous reader thread before starting a new one
+        if (readerThread_.joinable())
+            readerThread_.join();
+
+        channel_->AddRef();
+        readerThread_ = std::thread(&KqTunnelChannelCallback::pipeReaderLoop, this);
+        return true;
+    }
+
+    void closePipe()
+    {
+        HANDLE h = InterlockedExchangePointer(&pipe_, INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE)
+            CloseHandle(h);
+    }
+
+    void pipeReaderLoop()
+    {
+        std::vector<BYTE> buf(kq::bufferSize);
+        while (pipe_ != INVALID_HANDLE_VALUE) {
+            DWORD bytesRead = 0;
+            if (!ReadFile(pipe_, buf.data(), static_cast<DWORD>(buf.size()),
+                    &bytesRead, nullptr)) {
+                break;
+            }
+            if (bytesRead == 0)
+                continue;
+
+            if (channel_)
+                channel_->Write(bytesRead, buf.data(), nullptr);
+        }
+        channel_->Release();
+    }
+
     LONG refCount_;
     IWTSVirtualChannel* channel_;
+    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    std::thread readerThread_;
 };
 
 class KqTunnelListenerCallback : public IWTSListenerCallback
