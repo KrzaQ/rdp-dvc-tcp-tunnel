@@ -35,7 +35,7 @@ Requirements: `mingw-w64-gcc`, `conan` (2.x), `cmake`, `ninja`.
 make
 ```
 
-Binaries are in `build/Windows/src/{plugin,client,server}/`.
+Binaries are in `build/Windows/bin/`.
 
 ## Installation
 
