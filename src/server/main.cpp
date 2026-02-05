@@ -1,5 +1,6 @@
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -102,19 +103,13 @@ void tcpToDvc(asio::ip::tcp::socket& socket, HANDLE fileHandle)
 
 } // namespace
 
-int main(int argc, char* argv[])
+struct DvcHandles {
+    HANDLE channel;
+    HANDLE file;
+};
+
+DvcHandles openDvc()
 {
-    std::string host = kq::defaultTargetHost;
-    std::string port = std::to_string(kq::defaultTargetPort);
-
-    if (argc >= 2) host = argv[1];
-    if (argc >= 3) port = argv[2];
-
-    spdlog::info("kq-tunnel-server starting");
-    spdlog::info("  channel: {}", kq::channelName);
-    spdlog::info("  target:  {}:{}", host, port);
-
-    // Open DVC
     HANDLE dvc = WTSVirtualChannelOpenEx(
         WTS_CURRENT_SESSION,
         const_cast<LPSTR>(kq::channelName),
@@ -123,52 +118,107 @@ int main(int argc, char* argv[])
     if (dvc == nullptr) {
         spdlog::error("Failed to open DVC '{}' (error {})",
             kq::channelName, GetLastError());
-        return 1;
+        return {nullptr, nullptr};
     }
     spdlog::info("DVC opened");
 
-    // Get the underlying file handle for ReadFile/WriteFile
     PVOID buffer = nullptr;
     DWORD len = 0;
     if (!WTSVirtualChannelQuery(dvc, WTSVirtualFileHandle, &buffer, &len)) {
         spdlog::error("Failed to query DVC file handle (error {})", GetLastError());
         WTSVirtualChannelClose(dvc);
-        return 1;
+        return {nullptr, nullptr};
     }
 
     HANDLE fileHandle = *reinterpret_cast<HANDLE*>(buffer);
 
-    // Duplicate the handle since WTSFreeMemory will free the buffer
     HANDLE dupHandle = nullptr;
     DuplicateHandle(GetCurrentProcess(), fileHandle,
         GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     WTSFreeMemory(buffer);
-    fileHandle = dupHandle;
 
     spdlog::info("DVC file handle acquired");
+    return {dvc, dupHandle};
+}
 
-    // Connect to target TCP endpoint
-    asio::io_context io;
-    asio::ip::tcp::resolver resolver(io);
-    asio::ip::tcp::socket socket(io);
+int main(int argc, char* argv[])
+{
+    enum class Mode { connect, listen };
+    Mode mode = Mode::connect;
+    int argOffset = 1;
 
-    try {
-        auto endpoints = resolver.resolve(host, port);
-        asio::connect(socket, endpoints);
-    } catch (std::exception const& e) {
-        spdlog::error("TCP connect to {}:{} failed: {}", host, port, e.what());
-        CloseHandle(fileHandle);
-        WTSVirtualChannelClose(dvc);
-        return 1;
+    if (argc >= 2) {
+        std::string_view cmd = argv[1];
+        if (cmd == "connect") {
+            mode = Mode::connect;
+            argOffset = 2;
+        } else if (cmd == "listen") {
+            mode = Mode::listen;
+            argOffset = 2;
+        }
     }
-    spdlog::info("Connected to {}:{}", host, port);
 
-    // Bridge DVC <-> TCP with two threads
-    std::thread t1(dvcToTcp, fileHandle, std::ref(socket));
-    std::thread t2(tcpToDvc, std::ref(socket), fileHandle);
+    spdlog::info("kq-tunnel-server starting");
+    spdlog::info("  channel: {}", kq::channelName);
 
-    t1.join();
-    t2.join();
+    auto [dvc, fileHandle] = openDvc();
+    if (dvc == nullptr)
+        return 1;
+
+    asio::io_context io;
+
+    if (mode == Mode::connect) {
+        std::string host = kq::defaultTargetHost;
+        std::string port = std::to_string(kq::defaultTargetPort);
+        if (argOffset < argc)
+            host = argv[argOffset];
+        if (argOffset + 1 < argc)
+            port = argv[argOffset + 1];
+
+        spdlog::info("  mode: connect");
+        spdlog::info("  target: {}:{}", host, port);
+
+        asio::ip::tcp::resolver resolver(io);
+        asio::ip::tcp::socket socket(io);
+
+        try {
+            auto endpoints = resolver.resolve(host, port);
+            asio::connect(socket, endpoints);
+        } catch (std::exception const& e) {
+            spdlog::error("TCP connect to {}:{} failed: {}", host, port, e.what());
+            CloseHandle(fileHandle);
+            WTSVirtualChannelClose(dvc);
+            return 1;
+        }
+        spdlog::info("Connected to {}:{}", host, port);
+
+        std::thread t1(dvcToTcp, fileHandle, std::ref(socket));
+        std::thread t2(tcpToDvc, std::ref(socket), fileHandle);
+
+        t1.join();
+        t2.join();
+    } else {
+        uint16_t port = kq::defaultTargetPort;
+        if (argOffset < argc)
+            port = static_cast<uint16_t>(std::stoi(argv[argOffset]));
+
+        spdlog::info("  mode: listen");
+        spdlog::info("  listen port: {}", port);
+
+        asio::ip::tcp::acceptor acceptor(io,
+            asio::ip::tcp::endpoint(asio::ip::make_address("0.0.0.0"), port));
+
+        spdlog::info("Waiting for TCP connection on port {}...", port);
+        asio::ip::tcp::socket socket(io);
+        acceptor.accept(socket);
+        spdlog::info("TCP connection accepted");
+
+        std::thread t1(dvcToTcp, fileHandle, std::ref(socket));
+        std::thread t2(tcpToDvc, std::ref(socket), fileHandle);
+
+        t1.join();
+        t2.join();
+    }
 
     spdlog::info("Shutting down");
     CloseHandle(fileHandle);

@@ -10,14 +10,30 @@ Three build targets:
 
 - **kq-tunnel-plugin** (DLL) — thin COM shim loaded by mstsc/RDCMan, bridges
   DVC to a named pipe
-- **kq-tunnel-client** (EXE) — runs locally, listens on a TCP port, talks to
-  the plugin via named pipe
-- **kq-tunnel-server** (EXE) — runs in the RDP session, bridges DVC to a remote
-  TCP endpoint (e.g. SSH)
+- **kq-tunnel-client** (EXE) — runs locally, talks to the plugin via named pipe;
+  can listen on a TCP port (forward mode) or connect out (reverse mode)
+- **kq-tunnel-server** (EXE) — runs in the RDP session, bridges DVC to TCP;
+  can connect to a target (forward mode) or listen for incoming connections
+  (reverse mode)
 
-Data flow:
+Data flow (forward — default):
 ```
 ssh localhost:2222 → client.exe → named pipe → plugin.dll ←DVC→ server.exe → target:22
+```
+
+Data flow (reverse):
+```
+client.exe → host:port   ...   plugin.dll ←DVC→ server.exe ← incoming TCP
+```
+
+### CLI
+
+```
+kq-tunnel-client [listen] [port]            # forward mode (default)
+kq-tunnel-client connect <host> [port]      # reverse mode
+
+kq-tunnel-server [connect] [host] [port]    # forward mode (default)
+kq-tunnel-server listen [port]              # reverse mode
 ```
 
 ## Build

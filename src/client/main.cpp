@@ -1,5 +1,6 @@
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -110,58 +111,125 @@ void tcpToPipe(asio::ip::tcp::socket& socket, HANDLE pipe)
     CancelIoEx(pipe, nullptr);
 }
 
+HANDLE waitForPlugin()
+{
+    HANDLE pipe = createPipe();
+    if (pipe == INVALID_HANDLE_VALUE)
+        return INVALID_HANDLE_VALUE;
+
+    spdlog::info("Waiting for plugin to connect to pipe...");
+    OVERLAPPED connectOv{};
+    connectOv.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    BOOL connected = ConnectNamedPipe(pipe, &connectOv);
+    if (!connected) {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            WaitForSingleObject(connectOv.hEvent, INFINITE);
+        } else if (err != ERROR_PIPE_CONNECTED) {
+            spdlog::error("ConnectNamedPipe failed ({})", err);
+            CloseHandle(connectOv.hEvent);
+            CloseHandle(pipe);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    CloseHandle(connectOv.hEvent);
+    spdlog::info("Plugin connected to pipe");
+    return pipe;
+}
+
+void bridgeSession(HANDLE pipe, asio::ip::tcp::socket& socket)
+{
+    std::thread t1(pipeToTcp, pipe, std::ref(socket));
+    std::thread t2(tcpToPipe, std::ref(socket), pipe);
+
+    t1.join();
+    t2.join();
+
+    CloseHandle(pipe);
+    spdlog::info("Session ended, ready for next connection");
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
 {
-    uint16_t port = kq::defaultLocalPort;
-    if (argc >= 2) port = static_cast<uint16_t>(std::stoi(argv[1]));
+    enum class Mode { listen, connect };
+    Mode mode = Mode::listen;
+    int argOffset = 1;
+
+    if (argc >= 2) {
+        std::string_view cmd = argv[1];
+        if (cmd == "listen") {
+            mode = Mode::listen;
+            argOffset = 2;
+        } else if (cmd == "connect") {
+            mode = Mode::connect;
+            argOffset = 2;
+        }
+    }
 
     spdlog::info("kq-tunnel-client starting");
-    spdlog::info("  listen port: {}", port);
     spdlog::info("  pipe: {}", kq::pipeName);
 
     asio::io_context io;
-    asio::ip::tcp::acceptor acceptor(io,
-        asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
 
-    while (true) {
-        running = true;
+    if (mode == Mode::listen) {
+        uint16_t port = kq::defaultLocalPort;
+        if (argOffset < argc)
+            port = static_cast<uint16_t>(std::stoi(argv[argOffset]));
 
-        HANDLE pipe = createPipe();
-        if (pipe == INVALID_HANDLE_VALUE)
-            return 1;
+        spdlog::info("  mode: listen");
+        spdlog::info("  listen port: {}", port);
 
-        spdlog::info("Waiting for plugin to connect to pipe...");
-        OVERLAPPED connectOv{};
-        connectOv.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-        BOOL connected = ConnectNamedPipe(pipe, &connectOv);
-        if (!connected) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                WaitForSingleObject(connectOv.hEvent, INFINITE);
-            } else if (err != ERROR_PIPE_CONNECTED) {
-                spdlog::error("ConnectNamedPipe failed ({})", err);
-                CloseHandle(connectOv.hEvent);
+        asio::ip::tcp::acceptor acceptor(io,
+            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+        while (true) {
+            running = true;
+
+            HANDLE pipe = waitForPlugin();
+            if (pipe == INVALID_HANDLE_VALUE)
+                return 1;
+
+            spdlog::info("Waiting for TCP connection on port {}...", port);
+            asio::ip::tcp::socket socket(io);
+            acceptor.accept(socket);
+            spdlog::info("TCP connection accepted");
+
+            bridgeSession(pipe, socket);
+        }
+    } else {
+        std::string host = "localhost";
+        std::string port = std::to_string(kq::defaultLocalPort);
+        if (argOffset < argc)
+            host = argv[argOffset];
+        if (argOffset + 1 < argc)
+            port = argv[argOffset + 1];
+
+        spdlog::info("  mode: connect");
+        spdlog::info("  target: {}:{}", host, port);
+
+        asio::ip::tcp::resolver resolver(io);
+
+        while (true) {
+            running = true;
+
+            HANDLE pipe = waitForPlugin();
+            if (pipe == INVALID_HANDLE_VALUE)
+                return 1;
+
+            asio::ip::tcp::socket socket(io);
+            try {
+                auto endpoints = resolver.resolve(host, port);
+                asio::connect(socket, endpoints);
+            } catch (std::exception const& e) {
+                spdlog::error("TCP connect to {}:{} failed: {}", host, port, e.what());
                 CloseHandle(pipe);
                 continue;
             }
+            spdlog::info("Connected to {}:{}", host, port);
+
+            bridgeSession(pipe, socket);
         }
-        CloseHandle(connectOv.hEvent);
-        spdlog::info("Plugin connected to pipe");
-
-        spdlog::info("Waiting for TCP connection on port {}...", port);
-        asio::ip::tcp::socket socket(io);
-        acceptor.accept(socket);
-        spdlog::info("TCP connection accepted");
-
-        std::thread t1(pipeToTcp, pipe, std::ref(socket));
-        std::thread t2(tcpToPipe, std::ref(socket), pipe);
-
-        t1.join();
-        t2.join();
-
-        CloseHandle(pipe);
-        spdlog::info("Session ended, ready for next connection");
     }
 }

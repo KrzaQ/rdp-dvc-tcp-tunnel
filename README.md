@@ -5,6 +5,7 @@ Designed to forward SSH through an RDP session to a host behind a firewall.
 
 ## Architecture
 
+Forward mode (default -- local service exposed to RDP host):
 ```
 [local machine]                              [RDP host]
 
@@ -12,10 +13,22 @@ ssh localhost:2222
     |
     v
 kq-tunnel-client.exe                    kq-tunnel-server.exe
-  (TCP listener)                          (DVC <-> TCP bridge)
+  (TCP listener)                          (connects to target)
     |                                         |
     v                                         v
 named pipe <-- kq-tunnel-plugin.dll ---DVC--> target:22
+               (loaded by mstsc/RDCMan)
+```
+
+Reverse mode (RDP-host service exposed locally):
+```
+[local machine]                              [RDP host]
+
+kq-tunnel-client.exe                    kq-tunnel-server.exe
+  (connects to host:port)                 (TCP listener)
+    |                                         ^
+    v                                         |
+named pipe <-- kq-tunnel-plugin.dll ---DVC--> incoming TCP
                (loaded by mstsc/RDCMan)
 ```
 
@@ -23,7 +36,7 @@ Three components:
 
 - **kq-tunnel-plugin.dll** -- COM DVC plugin, loaded by the RDP client
 - **kq-tunnel-client.exe** -- runs on your local machine, bridges TCP to the named pipe
-- **kq-tunnel-server.exe** -- runs on the remote RDP host, bridges DVC to a TCP target
+- **kq-tunnel-server.exe** -- runs on the remote RDP host, bridges DVC to TCP
 
 ## Building
 
@@ -58,25 +71,55 @@ just run it.
 
 ## Usage
 
+Both binaries accept `listen` and `connect` subcommands. The defaults
+match the forward-tunnel case, so bare invocations work as before.
+
+```
+kq-tunnel-client [listen] [port]            # default: listen on 2222
+kq-tunnel-client connect <host> [port]
+
+kq-tunnel-server [connect] [host] [port]    # default: connect to localhost:22
+kq-tunnel-server listen [port]
+```
+
+### Forward tunnel (SSH through RDP)
+
 1. Start the client on your local machine:
    ```
-   kq-tunnel-client.exe [port]
+   kq-tunnel-client.exe
    ```
-   Default port is 2222.
 
 2. Connect to the remote machine via RDP (mstsc or RDCMan). The plugin
    loads automatically.
 
 3. In the RDP session, start the server:
    ```
-   kq-tunnel-server.exe [host] [port]
+   kq-tunnel-server.exe
    ```
-   Default target is `localhost:22`.
 
 4. SSH through the tunnel:
    ```
    ssh -p 2222 localhost
    ```
+
+### Reverse tunnel (expose RDP-host port locally)
+
+1. Start the client in connect mode:
+   ```
+   kq-tunnel-client.exe connect localhost 8080
+   ```
+
+2. Connect via RDP as usual.
+
+3. In the RDP session, start the server in listen mode:
+   ```
+   kq-tunnel-server.exe listen 9090
+   ```
+
+4. Connections to port 9090 on the RDP host are forwarded to
+   localhost:8080 on your local machine.
+
+### Notes
 
 Startup order is flexible -- the plugin connects to the named pipe lazily
 when data first flows through the DVC. The only requirement is that the
