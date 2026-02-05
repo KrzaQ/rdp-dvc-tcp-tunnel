@@ -2,6 +2,7 @@
 #include <initguid.h>
 #include <tsvirtualchannels.h>
 
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -25,15 +26,21 @@ public:
         : refCount_(1), channel_(channel)
     {
         channel_->AddRef();
+        shutdownEvent_ = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
+        // Start background thread that connects to the pipe and reads from it.
+        // This runs immediately so the pipe connection is attempted before any
+        // DVC data arrives, eliminating startup-order sensitivity.
+        channel_->AddRef();
+        ioThread_ = std::thread(&KqTunnelChannelCallback::connectAndRead, this);
     }
 
     ~KqTunnelChannelCallback()
     {
-        closePipe();
-        if (readerThread_.joinable())
-            readerThread_.join();
+        shutdown();
         if (channel_)
             channel_->Release();
+        CloseHandle(shutdownEvent_);
     }
 
     // IUnknown
@@ -60,21 +67,26 @@ public:
     // IWTSVirtualChannelCallback
     HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG size, BYTE* data) override
     {
-        if (!ensurePipe())
+        // Fast path: pipe already connected, write directly
+        HANDLE p = pipe_;
+        if (p != INVALID_HANDLE_VALUE) {
+            writePipe(p, data, size);
             return S_OK;
+        }
 
-        DWORD written = 0;
-        if (!WriteFile(pipe_, data, size, &written, nullptr)) {
-            closePipe();
+        // Slow path: pipe not connected yet, buffer data for the IO thread to flush
+        std::lock_guard lock(bufMtx_);
+        if (pipe_ != INVALID_HANDLE_VALUE) {
+            writePipe(pipe_, data, size);
+        } else {
+            pendingBuf_.insert(pendingBuf_.end(), data, data + size);
         }
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE OnClose() override
     {
-        closePipe();
-        if (readerThread_.joinable())
-            readerThread_.join();
+        shutdown();
         if (channel_) {
             channel_->Release();
             channel_ = nullptr;
@@ -83,65 +95,121 @@ public:
     }
 
 private:
-    bool ensurePipe()
+    void shutdown()
     {
-        if (pipe_ != INVALID_HANDLE_VALUE)
-            return true;
-
-        HANDLE h = CreateFileA(
-            kq::pipeName,
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            nullptr,
-            OPEN_EXISTING,
-            0,
-            nullptr);
-
-        if (h == INVALID_HANDLE_VALUE)
-            return false;
-
-        DWORD mode = PIPE_READMODE_BYTE;
-        SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
-        pipe_ = h;
-
-        // Join any previous reader thread before starting a new one
-        if (readerThread_.joinable())
-            readerThread_.join();
-
-        channel_->AddRef();
-        readerThread_ = std::thread(&KqTunnelChannelCallback::pipeReaderLoop, this);
-        return true;
+        SetEvent(shutdownEvent_);
+        closePipe();
+        if (ioThread_.joinable())
+            ioThread_.join();
     }
 
     void closePipe()
     {
         HANDLE h = InterlockedExchangePointer(&pipe_, INVALID_HANDLE_VALUE);
-        if (h != INVALID_HANDLE_VALUE)
+        if (h != INVALID_HANDLE_VALUE) {
+            CancelIoEx(h, nullptr);
             CloseHandle(h);
+        }
     }
 
-    void pipeReaderLoop()
+    void writePipe(HANDLE h, BYTE const* data, ULONG size)
     {
+        DWORD written = 0;
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = WriteFile(h, data, size, &written, &ov);
+
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING)
+                GetOverlappedResult(h, &ov, &written, TRUE);
+        }
+        CloseHandle(ov.hEvent);
+    }
+
+    void connectAndRead()
+    {
+        HANDLE h = INVALID_HANDLE_VALUE;
+        for (;;) {
+            h = CreateFileA(
+                kq::pipeName,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                nullptr);
+
+            if (h != INVALID_HANDLE_VALUE)
+                break;
+
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY) {
+                channel_->Release();
+                return;
+            }
+
+            if (WaitForSingleObject(shutdownEvent_, 500) == WAIT_OBJECT_0) {
+                channel_->Release();
+                return;
+            }
+        }
+
+        DWORD mode = PIPE_READMODE_BYTE;
+        SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
+
+        // Flush any data that OnDataReceived buffered while we were connecting,
+        // then publish the pipe handle so OnDataReceived writes directly.
+        {
+            std::lock_guard lock(bufMtx_);
+            if (!pendingBuf_.empty()) {
+                writePipe(h, pendingBuf_.data(),
+                    static_cast<ULONG>(pendingBuf_.size()));
+                pendingBuf_.clear();
+                pendingBuf_.shrink_to_fit();
+            }
+            pipe_ = h;
+        }
+
+        // Pipe reader loop: pipe -> DVC channel
         std::vector<BYTE> buf(kq::bufferSize);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
         while (pipe_ != INVALID_HANDLE_VALUE) {
             DWORD bytesRead = 0;
-            if (!ReadFile(pipe_, buf.data(), static_cast<DWORD>(buf.size()),
-                    &bytesRead, nullptr)) {
-                break;
+            ResetEvent(ov.hEvent);
+            BOOL ok = ReadFile(pipe_, buf.data(), static_cast<DWORD>(buf.size()),
+                    &bytesRead, &ov);
+
+            if (!ok) {
+                DWORD err = GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    if (!GetOverlappedResult(pipe_, &ov, &bytesRead, TRUE))
+                        break;
+                } else {
+                    break;
+                }
             }
+
             if (bytesRead == 0)
                 continue;
 
             if (channel_)
                 channel_->Write(bytesRead, buf.data(), nullptr);
         }
+
+        CloseHandle(ov.hEvent);
         channel_->Release();
     }
 
     LONG refCount_;
     IWTSVirtualChannel* channel_;
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
-    std::thread readerThread_;
+    HANDLE shutdownEvent_;
+    std::thread ioThread_;
+    std::mutex bufMtx_;
+    std::vector<BYTE> pendingBuf_;
 };
 
 class KqTunnelListenerCallback : public IWTSListenerCallback
