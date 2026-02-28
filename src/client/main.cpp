@@ -199,7 +199,7 @@ int main(int argc, char* argv[])
             bridgeSession(pipe, socket);
         }
     } else {
-        std::string host = "localhost";
+        std::string host = kq::defaultTargetHost;
         std::string port = std::to_string(kq::defaultLocalPort);
         if (argOffset < argc)
             host = argv[argOffset];
