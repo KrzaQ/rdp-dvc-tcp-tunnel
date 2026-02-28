@@ -18,3 +18,5 @@ build: configure
 
 clean:
 	rm -rf build
+
+-include Makefile.local
