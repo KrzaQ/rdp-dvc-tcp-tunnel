@@ -1,4 +1,3 @@
-#include <atomic>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -14,19 +13,29 @@
 
 namespace {
 
-std::atomic<bool> running{true};
-
 // ReadFile on a DVC file handle returns CHANNEL_PDU_HEADER (8 bytes) + payload.
 // WriteFile takes raw payload (no header needed).
 constexpr DWORD channelPduHeaderSize = 8;
 
-void dvcToTcp(HANDLE fileHandle, asio::ip::tcp::socket& socket)
+bool waitForIo(HANDLE file, OVERLAPPED& ov, DWORD& bytes, HANDLE cancelEvent)
+{
+    HANDLE handles[] = {ov.hEvent, cancelEvent};
+    DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    if (wait == WAIT_OBJECT_0) {
+        return GetOverlappedResult(file, &ov, &bytes, FALSE);
+    }
+    CancelIoEx(file, &ov);
+    GetOverlappedResult(file, &ov, &bytes, TRUE);
+    return false;
+}
+
+void dvcToTcp(HANDLE fileHandle, asio::ip::tcp::socket& socket, HANDLE cancelEvent)
 {
     std::vector<char> buf(kq::bufferSize);
     OVERLAPPED ov{};
     ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
-    while (running) {
+    for (;;) {
         DWORD bytesRead = 0;
         ResetEvent(ov.hEvent);
         BOOL ok = ReadFile(fileHandle, buf.data(),
@@ -35,7 +44,7 @@ void dvcToTcp(HANDLE fileHandle, asio::ip::tcp::socket& socket)
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(fileHandle, &ov, &bytesRead, TRUE)) {
+                if (!waitForIo(fileHandle, ov, bytesRead, cancelEvent)) {
                     spdlog::info("DVC read ended ({})", GetLastError());
                     break;
                 }
@@ -58,19 +67,19 @@ void dvcToTcp(HANDLE fileHandle, asio::ip::tcp::socket& socket)
             break;
         }
     }
-    running = false;
     CloseHandle(ov.hEvent);
+    SetEvent(cancelEvent);
     asio::error_code ec;
     socket.close(ec);
 }
 
-void tcpToDvc(asio::ip::tcp::socket& socket, HANDLE fileHandle)
+void tcpToDvc(asio::ip::tcp::socket& socket, HANDLE fileHandle, HANDLE cancelEvent)
 {
     std::vector<char> buf(kq::bufferSize);
     OVERLAPPED ov{};
     ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
-    while (running) {
+    for (;;) {
         asio::error_code ec;
         auto n = socket.read_some(asio::buffer(buf), ec);
         if (ec) {
@@ -86,7 +95,7 @@ void tcpToDvc(asio::ip::tcp::socket& socket, HANDLE fileHandle)
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(fileHandle, &ov, &bytesWritten, TRUE)) {
+                if (!waitForIo(fileHandle, ov, bytesWritten, cancelEvent)) {
                     spdlog::info("DVC write failed ({})", GetLastError());
                     break;
                 }
@@ -96,9 +105,8 @@ void tcpToDvc(asio::ip::tcp::socket& socket, HANDLE fileHandle)
             }
         }
     }
-    running = false;
     CloseHandle(ov.hEvent);
-    CancelIoEx(fileHandle, nullptr);
+    SetEvent(cancelEvent);
 }
 
 } // namespace
@@ -133,8 +141,13 @@ DvcHandles openDvc()
     HANDLE fileHandle = *reinterpret_cast<HANDLE*>(buffer);
 
     HANDLE dupHandle = nullptr;
-    DuplicateHandle(GetCurrentProcess(), fileHandle,
-        GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (!DuplicateHandle(GetCurrentProcess(), fileHandle,
+            GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        spdlog::error("DuplicateHandle failed (error {})", GetLastError());
+        WTSFreeMemory(buffer);
+        WTSVirtualChannelClose(dvc);
+        return {nullptr, nullptr};
+    }
     WTSFreeMemory(buffer);
 
     spdlog::info("DVC file handle acquired");
@@ -166,6 +179,7 @@ int main(int argc, char* argv[])
         return 1;
 
     asio::io_context io;
+    HANDLE cancelEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
     if (mode == Mode::connect) {
         std::string host = kq::defaultTargetHost;
@@ -186,14 +200,15 @@ int main(int argc, char* argv[])
             asio::connect(socket, endpoints);
         } catch (std::exception const& e) {
             spdlog::error("TCP connect to {}:{} failed: {}", host, port, e.what());
+            CloseHandle(cancelEvent);
             CloseHandle(fileHandle);
             WTSVirtualChannelClose(dvc);
             return 1;
         }
         spdlog::info("Connected to {}:{}", host, port);
 
-        std::thread t1(dvcToTcp, fileHandle, std::ref(socket));
-        std::thread t2(tcpToDvc, std::ref(socket), fileHandle);
+        std::thread t1(dvcToTcp, fileHandle, std::ref(socket), cancelEvent);
+        std::thread t2(tcpToDvc, std::ref(socket), fileHandle, cancelEvent);
 
         t1.join();
         t2.join();
@@ -213,14 +228,15 @@ int main(int argc, char* argv[])
         acceptor.accept(socket);
         spdlog::info("TCP connection accepted");
 
-        std::thread t1(dvcToTcp, fileHandle, std::ref(socket));
-        std::thread t2(tcpToDvc, std::ref(socket), fileHandle);
+        std::thread t1(dvcToTcp, fileHandle, std::ref(socket), cancelEvent);
+        std::thread t2(tcpToDvc, std::ref(socket), fileHandle, cancelEvent);
 
         t1.join();
         t2.join();
     }
 
     spdlog::info("Shutting down");
+    CloseHandle(cancelEvent);
     CloseHandle(fileHandle);
     WTSVirtualChannelClose(dvc);
     return 0;

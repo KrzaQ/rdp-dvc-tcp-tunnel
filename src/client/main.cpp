@@ -1,4 +1,3 @@
-#include <atomic>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -13,7 +12,17 @@
 
 namespace {
 
-std::atomic<bool> running{true};
+bool waitForIo(HANDLE file, OVERLAPPED& ov, DWORD& bytes, HANDLE cancelEvent)
+{
+    HANDLE handles[] = {ov.hEvent, cancelEvent};
+    DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    if (wait == WAIT_OBJECT_0) {
+        return GetOverlappedResult(file, &ov, &bytes, FALSE);
+    }
+    CancelIoEx(file, &ov);
+    GetOverlappedResult(file, &ov, &bytes, TRUE);
+    return false;
+}
 
 HANDLE createPipe()
 {
@@ -33,13 +42,13 @@ HANDLE createPipe()
     return pipe;
 }
 
-void pipeToTcp(HANDLE pipe, asio::ip::tcp::socket& socket)
+void pipeToTcp(HANDLE pipe, asio::ip::tcp::socket& socket, HANDLE cancelEvent)
 {
     std::vector<char> buf(kq::bufferSize);
     OVERLAPPED ov{};
     ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
-    while (running) {
+    for (;;) {
         DWORD bytesRead = 0;
         ResetEvent(ov.hEvent);
         BOOL ok = ReadFile(pipe, buf.data(), static_cast<DWORD>(buf.size()),
@@ -48,7 +57,7 @@ void pipeToTcp(HANDLE pipe, asio::ip::tcp::socket& socket)
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(pipe, &ov, &bytesRead, TRUE)) {
+                if (!waitForIo(pipe, ov, bytesRead, cancelEvent)) {
                     spdlog::info("Pipe read ended ({})", GetLastError());
                     break;
                 }
@@ -68,19 +77,19 @@ void pipeToTcp(HANDLE pipe, asio::ip::tcp::socket& socket)
             break;
         }
     }
-    running = false;
     CloseHandle(ov.hEvent);
+    SetEvent(cancelEvent);
     asio::error_code ec;
     socket.close(ec);
 }
 
-void tcpToPipe(asio::ip::tcp::socket& socket, HANDLE pipe)
+void tcpToPipe(asio::ip::tcp::socket& socket, HANDLE pipe, HANDLE cancelEvent)
 {
     std::vector<char> buf(kq::bufferSize);
     OVERLAPPED ov{};
     ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
 
-    while (running) {
+    for (;;) {
         asio::error_code ec;
         auto n = socket.read_some(asio::buffer(buf), ec);
         if (ec) {
@@ -96,7 +105,7 @@ void tcpToPipe(asio::ip::tcp::socket& socket, HANDLE pipe)
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(pipe, &ov, &written, TRUE)) {
+                if (!waitForIo(pipe, ov, written, cancelEvent)) {
                     spdlog::info("Pipe write failed ({})", GetLastError());
                     break;
                 }
@@ -106,9 +115,8 @@ void tcpToPipe(asio::ip::tcp::socket& socket, HANDLE pipe)
             }
         }
     }
-    running = false;
     CloseHandle(ov.hEvent);
-    CancelIoEx(pipe, nullptr);
+    SetEvent(cancelEvent);
 }
 
 HANDLE waitForPlugin()
@@ -139,12 +147,15 @@ HANDLE waitForPlugin()
 
 void bridgeSession(HANDLE pipe, asio::ip::tcp::socket& socket)
 {
-    std::thread t1(pipeToTcp, pipe, std::ref(socket));
-    std::thread t2(tcpToPipe, std::ref(socket), pipe);
+    HANDLE cancelEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
+    std::thread t1(pipeToTcp, pipe, std::ref(socket), cancelEvent);
+    std::thread t2(tcpToPipe, std::ref(socket), pipe, cancelEvent);
 
     t1.join();
     t2.join();
 
+    CloseHandle(cancelEvent);
     CloseHandle(pipe);
     spdlog::info("Session ended, ready for next connection");
 }
@@ -185,8 +196,6 @@ int main(int argc, char* argv[])
             asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
 
         while (true) {
-            running = true;
-
             HANDLE pipe = waitForPlugin();
             if (pipe == INVALID_HANDLE_VALUE)
                 return 1;
@@ -212,8 +221,6 @@ int main(int argc, char* argv[])
         asio::ip::tcp::resolver resolver(io);
 
         while (true) {
-            running = true;
-
             HANDLE pipe = waitForPlugin();
             if (pipe == INVALID_HANDLE_VALUE)
                 return 1;
